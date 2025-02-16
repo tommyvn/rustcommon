@@ -264,10 +264,18 @@ impl Ratelimiter {
         Ok(())
     }
 
+    pub fn return_n(&self, n: u64) {
+        self.available
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |a| {
+                Some(std::cmp::min(a + n, self.max_tokens()))
+            })
+            .unwrap();
+    }
+
     /// Non-blocking function to "wait" for a single token. On success, a single
     /// token has been acquired. On failure, a `Duration` hinting at when the
     /// next refill would occur is returned.
-    pub fn try_wait(&self) -> Result<(), core::time::Duration> {
+    pub fn try_wait_n(&self, n: u64) -> Result<(), core::time::Duration> {
         // We have an outer loop that drives the refilling of the token bucket.
         // This will only be repeated if we refill successfully, but somebody
         // else takes the newly available token(s) before we can attempt to
@@ -317,7 +325,7 @@ impl Ratelimiter {
                             // Refill failed and there were no tokens already
                             // available. We return the error which contains a
                             // duration until the next refill.
-                            return Err(e);
+                            return Err(e * (n/self.refill_amount()) as u32);
                         }
                     }
                 }
@@ -325,22 +333,33 @@ impl Ratelimiter {
                 // If we made it here, available is > 0 and so we can attempt to
                 // acquire a token by doing a simple compare exchange on
                 // available with the new value.
-                let new = available - 1;
-
-                if self
-                    .available
-                    .compare_exchange(available, new, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    // We have acquired a token and can return successfully
-                    return Ok(());
+                match available.overflowing_sub(n) {
+                    (new, false) => {
+                        if self
+                            .available
+                            .compare_exchange(available, new, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            // We have acquired a token and can return successfully
+                            return Ok(());
+                        }
+                    }
+                    (new, true) => {
+                        let short = u64::MAX - new;
+                        return Err(self.refill_interval() * (short/self.refill_amount()) as u32);
+                    }
                 }
+
 
                 // If we raced on the compare exchange, we need to repeat the
                 // token acquisition. Either there will be another token we can
                 // try to acquire, or we will break and attempt a refill again.
             }
         }
+    }
+
+    pub fn try_wait(&self) -> Result<(), core::time::Duration> {
+        self.try_wait_n(1)
     }
 }
 
@@ -466,6 +485,44 @@ mod tests {
 
         assert!(count >= 600);
         assert!(count <= 1400);
+    }
+
+    // quick test that a ratelimiter yields n tokens at the desired rate
+    #[test]
+    pub fn wait_n() {
+        let rl = Ratelimiter::builder(1, Duration::from_micros(10))
+            .max_tokens(3)
+            .build()
+            .unwrap();
+
+        let mut count = 0;
+        assert!((Duration::from_micros(10)..Duration::from_micros(30))
+            .contains(&rl.try_wait_n(3).unwrap_err()));
+
+        let now = Instant::now();
+        let end = now + Duration::from_millis(10);
+        while Instant::now() < end {
+            if rl.try_wait_n(3).is_ok() {
+                count += 1;
+            }
+        }
+
+        assert!(count >= 200);
+        assert!(count <= 460);
+    }
+
+    // quick test that a ratelimiter accepts n returned tokens
+    #[test]
+    pub fn return_n() {
+        let rl = Ratelimiter::builder(1, Duration::from_micros(10))
+            .max_tokens(3)
+            .build()
+            .unwrap();
+
+        assert!((Duration::from_micros(10)..Duration::from_micros(30))
+            .contains(&rl.try_wait_n(3).unwrap_err()));
+        rl.return_n(3);
+        assert!(&rl.try_wait_n(3).is_ok());
     }
 
     // quick test that an idle ratelimiter doesn't build up excess capacity
